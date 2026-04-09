@@ -295,7 +295,7 @@ async fn maybe_convert_chinese_variant(
         BuiltinConfig::Tw2sp
     } else {
         // Convert Simplified Chinese to Traditional Chinese
-        BuiltinConfig::S2twp
+        BuiltinConfig::S2tw
     };
 
     match OpenCC::from_config(config) {
@@ -501,42 +501,55 @@ impl ShortcutAction for TranscribeAction {
                     utils::hide_recording_overlay(&ah);
                     change_tray_icon(&ah, TrayIconState::Idle);
                 } else {
-                    // Save WAV concurrently with transcription
                     let sample_count = samples.len();
                     let file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
                     let wav_path_for_verify = wav_path.clone();
                     let samples_for_wav = samples.clone();
-                    let wav_handle = tauri::async_runtime::spawn_blocking(move || {
-                        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
-                    });
 
-                    // Transcribe concurrently with WAV save
+                    // For Groq Whisper: save WAV first, then send the saved file directly to Groq.
+                    // The saved WAV gives perfect quality; rebuilding WAV from samples can garble.
+                    let is_groq_whisper = get_settings(&ah).selected_model == "groq-whisper";
+
                     let transcription_time = Instant::now();
-                    let transcription_result = tm.transcribe(samples);
-
-                    // Await WAV save and verify
-                    let wav_saved = match wav_handle.await {
-                        Ok(Ok(())) => {
-                            match crate::audio_toolkit::verify_wav_file(
-                                &wav_path_for_verify,
-                                sample_count,
-                            ) {
-                                Ok(()) => true,
-                                Err(e) => {
-                                    error!("WAV verification failed: {}", e);
-                                    false
+                    let (transcription_result, wav_saved) = if is_groq_whisper {
+                        let save_ok = crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav).is_ok();
+                        let result = if save_ok {
+                            tm.transcribe_groq_wav(&wav_path_for_verify)
+                        } else {
+                            // Save failed — fall back to building WAV from samples
+                            tm.transcribe(samples, None)
+                        };
+                        (result, save_ok)
+                    } else {
+                        // Save WAV concurrently with transcription
+                        let wav_handle = tauri::async_runtime::spawn_blocking(move || {
+                            crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+                        });
+                        let result = tm.transcribe(samples, None);
+                        let saved = match wav_handle.await {
+                            Ok(Ok(())) => {
+                                match crate::audio_toolkit::verify_wav_file(
+                                    &wav_path_for_verify,
+                                    sample_count,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        error!("WAV verification failed: {}", e);
+                                        false
+                                    }
                                 }
                             }
-                        }
-                        Ok(Err(e)) => {
-                            error!("Failed to save WAV file: {}", e);
-                            false
-                        }
-                        Err(e) => {
-                            error!("WAV save task panicked: {}", e);
-                            false
-                        }
+                            Ok(Err(e)) => {
+                                error!("Failed to save WAV file: {}", e);
+                                false
+                            }
+                            Err(e) => {
+                                error!("WAV save task panicked: {}", e);
+                                false
+                            }
+                        };
+                        (result, saved)
                     };
 
                     match transcription_result {

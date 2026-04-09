@@ -43,6 +43,7 @@ enum LoadedEngine {
     SenseVoice(SenseVoiceModel),
     GigaAM(GigaAMModel),
     Canary(CanaryModel),
+    GroqWhisper,
 }
 
 /// RAII guard that clears the `is_loading` flag and notifies waiters on drop.
@@ -282,6 +283,27 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
+        // GroqWhisper is API-based — no local model file to load
+        if matches!(model_info.engine_type, EngineType::GroqWhisper) {
+            let mut engine_guard = self.lock_engine();
+            *engine_guard = Some(LoadedEngine::GroqWhisper);
+            drop(engine_guard);
+            {
+                let mut current_model = self.current_model_id.lock().unwrap();
+                *current_model = Some(model_id.to_string());
+            }
+            let _ = self.app_handle.emit(
+                "model-state-changed",
+                ModelStateEvent {
+                    event_type: "loaded".to_string(),
+                    model_id: Some(model_id.to_string()),
+                    model_name: Some(model_info.name.clone()),
+                    error: None,
+                },
+            );
+            return Ok(());
+        }
+
         let model_path = self.model_manager.get_model_path(model_id)?;
 
         // Create appropriate engine based on model type
@@ -367,6 +389,7 @@ impl TranscriptionManager {
                 })?;
                 LoadedEngine::Canary(engine)
             }
+            EngineType::GroqWhisper => unreachable!("GroqWhisper handled above"),
         };
 
         // Update the current engine and model ID
@@ -427,7 +450,7 @@ impl TranscriptionManager {
         current_model.clone()
     }
 
-    pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+    pub fn transcribe(&self, audio: Vec<f32>, wav_hint: Option<std::path::PathBuf>) -> Result<String> {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -600,6 +623,35 @@ impl TranscriptionManager {
                                 .transcribe(&audio, &options)
                                 .map_err(|e| anyhow::anyhow!("Canary transcription failed: {}", e))
                         }
+                        LoadedEngine::GroqWhisper => {
+                            let api_key = settings
+                                .post_process_api_keys
+                                .get("groq")
+                                .cloned()
+                                .unwrap_or_default();
+                            if api_key.is_empty() {
+                                return Err(anyhow::anyhow!(
+                                    "Groq API key not set. Add it in post-processing settings."
+                                ));
+                            }
+                            let language = if validated_language == "auto" {
+                                None
+                            } else {
+                                Some(validated_language.clone())
+                            };
+                            // Prefer the pre-saved WAV file (proven quality) over rebuilding from samples
+                            let result = if let Some(ref path) = wav_hint {
+                                transcribe_via_groq_file(path, &api_key, language.as_deref())
+                            } else {
+                                transcribe_via_groq(&audio, &api_key, language.as_deref())
+                            };
+                            result
+                                .map(|text| transcribe_rs::TranscriptionResult {
+                                    text,
+                                    segments: None,
+                                })
+                                .map_err(|e| anyhow::anyhow!("Groq transcription failed: {}", e))
+                        }
                     }
                 },
             ));
@@ -690,7 +742,15 @@ impl TranscriptionManager {
             translation_note
         );
 
-        let final_result = filtered_result;
+        // For Groq Whisper, add paragraph breaks after all filtering is done
+        let final_result = if matches!(
+            self.lock_engine().as_ref(),
+            Some(LoadedEngine::GroqWhisper)
+        ) {
+            add_paragraphs(&filtered_result, "")
+        } else {
+            filtered_result
+        };
 
         if final_result.is_empty() {
             info!("Transcription result is empty");
@@ -700,6 +760,38 @@ impl TranscriptionManager {
 
         self.maybe_unload_immediately("transcription");
 
+        Ok(final_result)
+    }
+
+    /// Transcribe a pre-saved WAV file via Groq Whisper API.
+    /// Applies the same filtering and paragraph logic as `transcribe()`.
+    /// Returns Err if the model is not GroqWhisper or the API key is missing.
+    pub fn transcribe_groq_wav(&self, wav_path: &std::path::Path) -> Result<String> {
+        let settings = get_settings(&self.app_handle);
+        let api_key = settings
+            .post_process_api_keys
+            .get("groq")
+            .cloned()
+            .unwrap_or_default();
+        if api_key.is_empty() {
+            return Err(anyhow::anyhow!("Groq API key not set"));
+        }
+        let language = if settings.selected_language == "auto" {
+            None
+        } else {
+            Some(settings.selected_language.clone())
+        };
+
+        let raw = transcribe_via_groq_file(wav_path, &api_key, language.as_deref())?;
+
+        let filtered = filter_transcription_output(&raw, &settings.app_language, &settings.custom_filler_words);
+        let final_result = add_paragraphs(&filtered, "");
+
+        if final_result.is_empty() {
+            info!("Groq WAV transcription result is empty");
+        } else {
+            info!("Groq WAV transcription result: {}", final_result);
+        }
         Ok(final_result)
     }
 }
@@ -812,4 +904,229 @@ impl Drop for TranscriptionManager {
             }
         }
     }
+}
+
+/// Convert f32 audio samples to WAV bytes (16-bit PCM, mono).
+fn audio_to_wav(samples: &[f32], sample_rate: u32) -> Result<Vec<u8>> {
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    use std::io::Cursor;
+
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut cursor = Cursor::new(Vec::new());
+    {
+        let mut writer = WavWriter::new(&mut cursor, spec)
+            .map_err(|e| anyhow::anyhow!("WAV writer error: {}", e))?;
+        for &sample in samples {
+            let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            writer
+                .write_sample(s)
+                .map_err(|e| anyhow::anyhow!("WAV write error: {}", e))?;
+        }
+        writer
+            .finalize()
+            .map_err(|e| anyhow::anyhow!("WAV finalize error: {}", e))?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Call Groq Whisper API using an already-saved WAV file.
+/// This avoids rebuilding the WAV from samples, which can produce different results.
+fn transcribe_via_groq_file(
+    wav_path: &std::path::Path,
+    api_key: &str,
+    language: Option<&str>,
+) -> Result<String> {
+    use std::process::Command;
+
+    let mut args: Vec<String> = vec![
+        "--noproxy".into(), "*".into(),
+        "-s".into(), "--fail-with-body".into(),
+        "-X".into(), "POST".into(),
+        "https://api.groq.com/openai/v1/audio/transcriptions".into(),
+        "-H".into(), format!("Authorization: Bearer {}", api_key),
+        "-F".into(), "model=whisper-large-v3".into(),
+        "-F".into(), "response_format=text".into(),
+        "-F".into(), format!(
+            "file=@{};filename=audio.wav;type=audio/wav",
+            wav_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
+        ),
+        "-F".into(), "temperature=0".into(),
+    ];
+
+    if let Some(lang) = language {
+        args.push("-F".into());
+        args.push(format!("language={}", lang));
+    }
+
+    let output = Command::new("curl")
+        .args(&args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
+
+    if !output.status.success() {
+        let body = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Groq API error: {} {}", body, stderr));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(apply_word_fixes(&raw))
+}
+
+/// Call Groq Whisper API and return transcribed text.
+/// Uses curl with --noproxy to bypass system proxy settings.
+fn transcribe_via_groq(
+    audio: &[f32],
+    api_key: &str,
+    language: Option<&str>,
+) -> Result<String> {
+    use std::io::Write;
+    use std::process::Command;
+
+    // Pad with 50ms of silence at start so Whisper doesn't clip the first word
+    let silence_samples = (16000 * 50 / 1000) as usize; // 800 samples at 16kHz
+    let mut padded = vec![0.0f32; silence_samples];
+    padded.extend_from_slice(audio);
+    let wav_data = audio_to_wav(&padded, 16000)?;
+
+    // Write WAV to a temp file so curl can upload it
+    let temp_path = std::env::temp_dir().join("handy_groq_audio.wav");
+    {
+        let mut f = std::fs::File::create(&temp_path)
+            .map_err(|e| anyhow::anyhow!("Failed to create temp WAV: {}", e))?;
+        f.write_all(&wav_data)
+            .map_err(|e| anyhow::anyhow!("Failed to write temp WAV: {}", e))?;
+    }
+
+    let mut args: Vec<String> = vec![
+        "--noproxy".into(), "*".into(),
+        "-s".into(), "--fail-with-body".into(),
+        "-X".into(), "POST".into(),
+        "https://api.groq.com/openai/v1/audio/transcriptions".into(),
+        "-H".into(), format!("Authorization: Bearer {}", api_key),
+        "-F".into(), "model=whisper-large-v3".into(),
+        "-F".into(), "response_format=text".into(),
+        "-F".into(), format!(
+            "file=@{};filename=audio.wav;type=audio/wav",
+            temp_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
+        ),
+        "-F".into(), "temperature=0".into(),
+    ];
+
+    if let Some(lang) = language {
+        args.push("-F".into());
+        args.push(format!("language={}", lang));
+    }
+
+    let output = Command::new("curl")
+        .args(&args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
+
+    let _ = std::fs::remove_file(&temp_path);
+
+    if !output.status.success() {
+        let body = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("Groq API error: {} {}", body, stderr));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(apply_word_fixes(&raw))
+}
+
+/// Fix common transcription errors for specific terms.
+fn apply_word_fixes(text: &str) -> String {
+    use regex::Regex;
+
+    // Each entry: (pattern, replacement) — case-insensitive match
+    let fixes: &[(&str, &str)] = &[
+        // Getcourse variants
+        (r"(?i)\bget[\s-]?cours[a-zа-яё]*\b", "Getcourse"),
+        (r"(?i)\bgit[\s-]?cours[a-zа-яё]*\b", "Getcourse"),
+        (r"(?i)\bгеткурс[а-яё]*\b", "Геткурс"),
+        (r"(?i)\bгит[\s-]?курс[а-яё]*\b", "Геткурс"),
+        // Вагэ variants
+        (r"(?i)\bваге\b", "Вагэ"),
+        (r"(?i)\bвлаге\b", "Вагэ"),
+        (r"(?i)\bвг\b", "Вагэ"),
+        // VS Code variants
+        (r"(?i)\bвисекот\b", "VS Code"),
+        (r"(?i)\bвиси[\s-]?код\b", "VS Code"),
+        (r"(?i)\bvisi[\s-]?code\b", "VS Code"),
+        // Claude Code variants
+        (r"(?i)\bcloth[\s-]?code\b", "Claude Code"),
+        (r"(?i)\bcloud[\s-]?cloud\b", "Claude Code"),
+        (r"(?i)\bclaw[\s-]?code\b", "Claude Code"),
+        // OpenClaw
+        (r"(?i)\bopen[\s-]?close\b", "OpenClaw"),
+        // Lovable
+        (r"(?i)\blava[\s-]?bull\b", "Lovable"),
+        // SuperWhisper
+        (r"(?i)\bsuper[\s-]?whisper\b", "SuperWhisper"),
+        (r"(?i)\bvisper\b", "SuperWhisper"),
+        // API
+        (r"(?i)\bА[рp]\b", "API"),
+        // md
+        (r"(?i)\bмд\b", "md"),
+        // референсы
+        (r"(?i)референци[яи]", "референсы"),
+        // скилами
+        (r"(?i)скелами", "скилами"),
+        // Cowork
+        (r"(?i)\bclawrk\b", "Cowork"),
+        (r"(?i)\bко[\s-]?ворк\b", "Cowork"),
+    ];
+
+    let mut result = text.to_string();
+    for (pattern, replacement) in fixes {
+        if let Ok(re) = Regex::new(pattern) {
+            result = re.replace_all(&result, *replacement).to_string();
+        }
+    }
+
+    // Remove trailing syllable artifacts: Whisper sometimes splits the last word across
+    // chunks, leaving a short fragment glued after the final punctuation mark.
+    // e.g. "все. Да.ть" → "все. Да."  (strips the dangling "ть")
+    if let Ok(re) = Regex::new(r"([.!?])[а-яёА-ЯЁa-zA-Z]{1,4}$") {
+        result = re.replace(&result, "$1").to_string();
+    }
+
+    result
+}
+
+/// Break long transcription into paragraphs: every 3 sentences = new paragraph.
+fn add_paragraphs(text: &str, _api_key: &str) -> String {
+    if text.chars().count() < 200 {
+        return text.to_string();
+    }
+
+    // Split into sentences on . ! ? keeping the delimiter
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if matches!(ch, '.' | '!' | '?') {
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() {
+                sentences.push(trimmed);
+            }
+            current.clear();
+        }
+    }
+    if !current.trim().is_empty() {
+        sentences.push(current.trim().to_string());
+    }
+
+    // Group every 3 sentences into a paragraph
+    sentences
+        .chunks(3)
+        .map(|chunk| chunk.join(" "))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }

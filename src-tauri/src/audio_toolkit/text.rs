@@ -231,6 +231,11 @@ fn get_filler_words_for_language(lang: &str) -> &'static [&'static str] {
 
 static MULTI_SPACE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
 
+// Whisper hallucination patterns that appear at the end of transcriptions
+static WHISPER_HALLUCINATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\s*[Сс]убтитр[ыа](\s+(создавал[аи]?|перевод[ил]*|by|сделал[аи]?))?[\s\S]*$").unwrap()
+});
+
 /// Collapses repeated 1-2 letter words (3+ repetitions) to a single instance.
 /// E.g., "wh wh wh wh" -> "wh", "I I I I" -> "I"
 fn collapse_stutters(text: &str) -> String {
@@ -309,6 +314,9 @@ pub fn filter_transcription_output(
     for pattern in &patterns {
         filtered = pattern.replace_all(&filtered, "").to_string();
     }
+
+    // Strip Whisper subtitle hallucinations ("Субтитры создавал DimaTorzok" etc.)
+    filtered = WHISPER_HALLUCINATION_PATTERN.replace(&filtered, "").to_string();
 
     // Collapse repeated 1-2 letter words (stutter artifacts like "wh wh wh wh")
     filtered = collapse_stutters(&filtered);

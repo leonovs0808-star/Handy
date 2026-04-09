@@ -83,8 +83,16 @@ pub async fn retry_history_entry_transcription(
 
     transcription_manager.initiate_model_load();
 
+    // For Groq Whisper, pass the original WAV path so we use it directly (better quality)
+    let settings = crate::settings::get_settings(&app);
+    let wav_hint = if settings.selected_model == "groq-whisper" {
+        Some(audio_path.clone())
+    } else {
+        None
+    };
+
     let tm = Arc::clone(&transcription_manager);
-    let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples))
+    let transcription = tauri::async_runtime::spawn_blocking(move || tm.transcribe(samples, wav_hint))
         .await
         .map_err(|e| format!("Transcription task panicked: {}", e))?
         .map_err(|e| e.to_string())?;

@@ -26,6 +26,7 @@ pub enum EngineType {
     SenseVoice,
     GigaAM,
     Canary,
+    GroqWhisper,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -253,7 +254,7 @@ impl ModelManager {
                 speed_score: 0.35,
                 supports_translation: false,
                 is_recommended: false,
-                supported_languages: whisper_languages,
+                supported_languages: whisper_languages.clone(),
                 supports_language_selection: true,
                 is_custom: false,
             },
@@ -468,6 +469,32 @@ impl ModelManager {
                 supports_translation: false,
                 is_recommended: false,
                 supported_languages: sense_voice_languages,
+                supports_language_selection: true,
+                is_custom: false,
+            },
+        );
+
+        // Groq Whisper — cloud API, always available, no download needed
+        available_models.insert(
+            "groq-whisper".to_string(),
+            ModelInfo {
+                id: "groq-whisper".to_string(),
+                name: "Groq Whisper".to_string(),
+                description: "Cloud transcription via Groq API. Requires Groq API key in post-processing settings. Fast and accurate.".to_string(),
+                filename: "groq-whisper".to_string(),
+                url: None,
+                sha256: None,
+                size_mb: 0,
+                is_downloaded: true,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::GroqWhisper,
+                accuracy_score: 0.95,
+                speed_score: 0.90,
+                supports_translation: false,
+                is_recommended: true,
+                supported_languages: whisper_languages.clone(),
                 supports_language_selection: true,
                 is_custom: false,
             },
