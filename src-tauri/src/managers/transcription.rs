@@ -784,7 +784,12 @@ impl TranscriptionManager {
 
         let raw = transcribe_via_groq_file(wav_path, &api_key, language.as_deref())?;
 
-        let filtered = filter_transcription_output(&raw, &settings.app_language, &settings.custom_filler_words);
+        let cleaned = llm_post_process(&raw, &api_key).unwrap_or_else(|e| {
+            error!("LLM post-process failed, using raw: {}", e);
+            raw.clone()
+        });
+
+        let filtered = filter_transcription_output(&cleaned, &settings.app_language, &settings.custom_filler_words);
         let final_result = add_paragraphs(&filtered, "");
 
         if final_result.is_empty() {
@@ -951,6 +956,7 @@ fn transcribe_via_groq_file(
         "-H".into(), format!("Authorization: Bearer {}", api_key),
         "-F".into(), "model=whisper-large-v3".into(),
         "-F".into(), "response_format=text".into(),
+        "-F".into(), "prompt=Геткурс, Getcourse, Claude, VPN, VS Code, GPT, Вагэ".into(),
         "-F".into(), format!(
             "file=@{};filename=audio.wav;type=audio/wav",
             wav_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
@@ -963,19 +969,30 @@ fn transcribe_via_groq_file(
         args.push(format!("language={}", lang));
     }
 
-    let output = Command::new("curl")
-        .args(&args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
+    let max_retries = 3;
+    for attempt in 0..max_retries {
+        let output = Command::new("curl")
+            .args(&args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
 
-    if !output.status.success() {
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !raw.is_empty() {
+                return Ok(apply_word_fixes(&raw));
+            }
+        }
+
+        if attempt < max_retries - 1 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            continue;
+        }
+
         let body = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("Groq API error: {} {}", body, stderr));
+        return Err(anyhow::anyhow!("Groq API error (after {} retries): {} {}", max_retries, body, stderr));
     }
-
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(apply_word_fixes(&raw))
+    unreachable!()
 }
 
 /// Call Groq Whisper API and return transcribed text.
@@ -1011,6 +1028,7 @@ fn transcribe_via_groq(
         "-H".into(), format!("Authorization: Bearer {}", api_key),
         "-F".into(), "model=whisper-large-v3".into(),
         "-F".into(), "response_format=text".into(),
+        "-F".into(), "prompt=Геткурс, Getcourse, Claude, VPN, VS Code, GPT, Вагэ".into(),
         "-F".into(), format!(
             "file=@{};filename=audio.wav;type=audio/wav",
             temp_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
@@ -1023,17 +1041,34 @@ fn transcribe_via_groq(
         args.push(format!("language={}", lang));
     }
 
-    let output = Command::new("curl")
-        .args(&args)
-        .output()
-        .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
+    let max_retries = 3;
+    let mut last_output = None;
+    for attempt in 0..max_retries {
+        let output = Command::new("curl")
+            .args(&args)
+            .output()
+            .map_err(|e| anyhow::anyhow!("curl error: {}", e))?;
+
+        if output.status.success() {
+            let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !raw.is_empty() {
+                let _ = std::fs::remove_file(&temp_path);
+                return Ok(apply_word_fixes(&raw));
+            }
+        }
+
+        last_output = Some(output);
+        if attempt < max_retries - 1 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
 
     let _ = std::fs::remove_file(&temp_path);
-
+    let output = last_output.unwrap();
     if !output.status.success() {
         let body = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!("Groq API error: {} {}", body, stderr));
+        return Err(anyhow::anyhow!("Groq API error (after {} retries): {} {}", max_retries, body, stderr));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -1100,6 +1135,67 @@ fn apply_word_fixes(text: &str) -> String {
     result
 }
 
+/// LLM post-processing: fix punctuation, spelling (Claude, VPN, Геткурс), remove filler words.
+fn llm_post_process(text: &str, api_key: &str) -> Result<String> {
+    use std::process::Command;
+
+    if text.trim().is_empty() {
+        return Ok(text.to_string());
+    }
+
+    let prompt = r#"Исправь транскрипцию русской речи:
+1. Исправь очевидные ошибки распознавания (например: «Clow» → «Claude», «клоу» → «Claw», «клод клоу» → «ClaudeClaw», «PPN» или «ВПН» → «VPN», «Клод Кот» или «КloдCot» → «Claude Code», «геткурс» или «ГитКур» → «Геткурс», «Getcourse»)
+2. Расставь точки, запятые, вопросительные знаки
+3. Расставь заглавные буквы после точек
+4. Сохрани смысл и порядок слов точно
+5. Верни только исправленный текст, без пояснений"#;
+
+    let body = format!(
+        r#"{{"model":"llama-3.1-8b-instant","messages":[{{"role":"system","content":"Ты корректор транскрипций. Исправляй только ошибки распознавания и пунктуацию. Не меняй смысл, не добавляй от себя."}},{{"role":"user","content":"{}\n\nТранскрипция:\n{}"}}],"temperature":0}}"#,
+        prompt.replace('"', r#"\""#).replace('\n', r#"\n"#),
+        text.replace('"', r#"\""#).replace('\n', r#"\n"#)
+    );
+
+    let output = Command::new("curl")
+        .args(&[
+            "--noproxy", "*",
+            "-s", "--fail-with-body",
+            "-X", "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            "-H", &format!("Authorization: Bearer {}", api_key),
+            "-H", "Content-Type: application/json",
+            "-d", &body,
+        ])
+        .output()
+        .map_err(|e| anyhow::anyhow!("LLM curl error: {}", e))?;
+
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stdout);
+        return Err(anyhow::anyhow!("LLM API error: {}", err));
+    }
+
+    let response = String::from_utf8_lossy(&output.stdout);
+    // Extract content from JSON: {"choices":[{"message":{"role":"assistant","content":"..."}}]}
+    // Use rfind to get the LAST "content":" which is the assistant's response, not system echo
+    if let Some(start) = response.rfind(r#""content":""#) {
+        let content_start = start + r#""content":""#.len();
+        if let Some(end) = response[content_start..].find(r#"","refusal"#)
+            .or_else(|| response[content_start..].find(r#""},"logprobs"#))
+            .or_else(|| response[content_start..].find(r#""}"#))
+        {
+            let content = &response[content_start..content_start + end];
+            let unescaped = content
+                .replace(r#"\n"#, "\n")
+                .replace(r#"\""#, "\"")
+                .replace(r#"\\"#, "\\");
+            return Ok(unescaped);
+        }
+    }
+
+    // Fallback: return raw text if parsing fails
+    Err(anyhow::anyhow!("Failed to parse LLM response"))
+}
+
 /// Break long transcription into paragraphs: every 3 sentences = new paragraph.
 fn add_paragraphs(text: &str, _api_key: &str) -> String {
     if text.chars().count() < 200 {
@@ -1121,6 +1217,29 @@ fn add_paragraphs(text: &str, _api_key: &str) -> String {
     }
     if !current.trim().is_empty() {
         sentences.push(current.trim().to_string());
+    }
+
+    // If no punctuation found (1 giant "sentence"), split by commas instead
+    if sentences.len() <= 1 && text.chars().count() > 300 {
+        let parts: Vec<&str> = text.split(',').collect();
+        if parts.len() > 1 {
+            let mut paragraphs: Vec<String> = Vec::new();
+            let mut current_para = String::new();
+            for part in &parts {
+                if !current_para.is_empty() {
+                    current_para.push(',');
+                }
+                current_para.push_str(part);
+                if current_para.chars().count() > 300 {
+                    paragraphs.push(current_para.trim().to_string());
+                    current_para = String::new();
+                }
+            }
+            if !current_para.trim().is_empty() {
+                paragraphs.push(current_para.trim().to_string());
+            }
+            return paragraphs.join("\n\n");
+        }
     }
 
     // Group every 3 sentences into a paragraph
