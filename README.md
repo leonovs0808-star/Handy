@@ -1,6 +1,8 @@
 # Handy
 
 > 🇷🇺 **Русским пользователям:** это форк [cjpais/Handy](https://github.com/cjpais/Handy) с поддержкой **русской речи через Groq Whisper**. Установка и настройка — в файле **[УСТАНОВКА.md](УСТАНОВКА.md)**.
+>
+> Сборку докрутил и поддерживает **Сергей Сипита** — [@SipitaSergey](https://t.me/SipitaSergey) в Telegram. Вопросы, баги, идеи — туда.
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
 
