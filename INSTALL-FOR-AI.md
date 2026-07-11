@@ -96,17 +96,30 @@ Handy использует Groq Whisper (whisper-large-v3) для распозн
 
 Открой Handy. Пройди по разделам настроек:
 
-1. Открой **Settings** (шестерёнка).
-2. **Ввод API-ключа Groq** — не в отдельном разделе "API Keys". Ключ живёт в подразделе Post Process, который скрыт по умолчанию. Точный путь (боковая панель Handy):
-   - Зайди в раздел **Advanced** (в боковой панели).
-   - Включи тумблер **Experimental Features**.
-   - Ниже появится группа **Experimental** с тумблером **Post Processing** → включи.
-   - В **боковой панели слева** появится новый пункт **Post Process** → зайди туда.
-   - В поле **Provider** выбери **Groq**.
-   - В поле **API Key** вставь `gsk_...`.
-   - После ввода можно вернуться в Advanced и **выключить тумблер Post Processing** обратно — раздел Post Process уйдёт из sidebar, но ключ сохранится. Наш движок Groq Whisper использует его напрямую независимо от тумблера пост-процессинга.
-3. Раздел **Models** → кликни на **Groq Whisper**.
-   - **ВАЖНО:** предупреди пользователя, чтобы он **НЕ нажимал "Download"/"Скачать"** у Groq Whisper. Это облачная модель, скачивать нечего. Нужно просто кликнуть на неё для выбора. Если пользователь нажмёт "Скачать" — он увидит `No download URL for model` — это нормально, не баг, просто эта кнопка для облачной модели не работает.
+**Не веди пользователя через UI-настройки Handy — они путаны и разбросаны.** Пропиши Groq-ключ **напрямую в JSON-файл настроек Handy** одной командой, это надёжнее и быстрее.
+
+1. Пусть пользователь **запустит Handy один раз и закроет** (Handy → Quit). Это нужно чтобы файл настроек создался.
+2. Проверь путь файла настроек:
+   - macOS: `~/Library/Application Support/com.pais.handy/settings_store.json`
+   - Windows: `%APPDATA%\com.pais.handy\settings_store.json`
+   - Linux: `~/.local/share/com.pais.handy/settings_store.json`
+3. Впиши в него ключ. Простая команда для macOS/Linux (замени `<KEY>` на Groq-ключ пользователя):
+
+   ```bash
+   python3 -c "
+   import json, os
+   p = os.path.expanduser('~/Library/Application Support/com.pais.handy/settings_store.json')
+   d = json.load(open(p))
+   d['settings'].setdefault('post_process_api_keys', {})['groq'] = '<KEY>'
+   json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+   print('OK')
+   "
+   ```
+
+   Для Windows PowerShell — аналог через ConvertFrom-Json / ConvertTo-Json.
+
+4. Открой Handy → **Настройки** → **Модели** → выбери **Groq Whisper** (просто кликни, не жми "Скачать" — увидишь ошибку `No download URL for model`, это не баг, а особенность облачной модели).
+5. **Настройки** → **Общие** → **Язык** → **Русский**.
 4. Раздел **General** → **Language** → **Russian**.
 5. Раздел **Shortcuts** → проверь горячую клавишу. По умолчанию:
    - Mac: **Option + Space**
