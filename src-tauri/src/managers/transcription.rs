@@ -782,12 +782,28 @@ impl TranscriptionManager {
             Some(settings.selected_language.clone())
         };
 
-        let raw = transcribe_via_groq_file(wav_path, &api_key, language.as_deref())?;
+        // Resolve VAD model path so we can trim trailing silence before sending audio to Whisper.
+        // Whisper hallucinates ("Субтитры…", "Продолжение следует", etc.) when it sees silence —
+        // VAD-trim eliminates the trigger at the audio level instead of post-filtering text.
+        let vad_path = self
+            .app_handle
+            .path()
+            .resolve(
+                "resources/models/silero_vad_v4.onnx",
+                tauri::path::BaseDirectory::Resource,
+            )
+            .ok();
 
-        let cleaned = llm_post_process(&raw, &api_key).unwrap_or_else(|e| {
-            error!("LLM post-process failed, using raw: {}", e);
+        let raw = transcribe_groq_wav_in_chunks(wav_path, &api_key, language.as_deref(), vad_path.as_deref())?;
+
+        let cleaned = if settings.post_process_enabled {
+            llm_post_process(&raw, &api_key).unwrap_or_else(|e| {
+                error!("LLM post-process failed, using raw: {}", e);
+                raw.clone()
+            })
+        } else {
             raw.clone()
-        });
+        };
 
         let filtered = filter_transcription_output(&cleaned, &settings.app_language, &settings.custom_filler_words);
         let final_result = add_paragraphs(&filtered, "");
@@ -956,7 +972,6 @@ fn transcribe_via_groq_file(
         "-H".into(), format!("Authorization: Bearer {}", api_key),
         "-F".into(), "model=whisper-large-v3".into(),
         "-F".into(), "response_format=text".into(),
-        "-F".into(), "prompt=Геткурс, Getcourse, Claude, VPN, VS Code, GPT, Вагэ".into(),
         "-F".into(), format!(
             "file=@{};filename=audio.wav;type=audio/wav",
             wav_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
@@ -995,6 +1010,228 @@ fn transcribe_via_groq_file(
     unreachable!()
 }
 
+/// Trim trailing silence from i16 samples using Silero VAD.
+/// Returns (trimmed_samples, trimmed_secs) — trimmed_secs is how much was cut off.
+/// Whisper hallucinates on silence: "Субтитры создавал…", "Продолжение следует…", "Спасибо за просмотр".
+/// Removing silence at audio level eliminates the root trigger.
+fn trim_trailing_silence_i16(
+    samples: Vec<i16>,
+    sample_rate: u32,
+    channels: u16,
+    vad_path: &std::path::Path,
+) -> (Vec<i16>, f64) {
+    use crate::audio_toolkit::vad::{SileroVad, VoiceActivityDetector};
+
+    // Silero is trained on 16kHz mono. If our WAV is something else, skip trim.
+    if sample_rate != 16000 || channels != 1 {
+        return (samples, 0.0);
+    }
+
+    let mut vad = match SileroVad::new(vad_path, 0.3) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("VAD init failed, skipping silence trim: {}", e);
+            return (samples, 0.0);
+        }
+    };
+
+    const FRAME: usize = 480; // 30ms @ 16kHz
+    // Scan all frames, record index of last speech frame
+    let mut last_speech_frame: Option<usize> = None;
+    for (i, frame) in samples.chunks(FRAME).enumerate() {
+        if frame.len() != FRAME {
+            break;
+        }
+        let frame_f32: Vec<f32> = frame.iter().map(|&s| s as f32 / 32768.0).collect();
+        if let Ok(fr) = vad.push_frame(&frame_f32) {
+            if fr.is_speech() {
+                last_speech_frame = Some(i);
+            }
+        }
+    }
+
+    let Some(last) = last_speech_frame else {
+        // No speech detected at all — return as-is to avoid producing empty audio
+        return (samples, 0.0);
+    };
+
+    // Keep speech + 300ms tail margin (= 10 frames)
+    let keep_frames = (last + 10).min(samples.len() / FRAME);
+    let keep_samples = keep_frames * FRAME;
+    if keep_samples >= samples.len() {
+        return (samples, 0.0);
+    }
+    let trimmed_secs = (samples.len() - keep_samples) as f64 / sample_rate as f64;
+    let mut trimmed = samples;
+    trimmed.truncate(keep_samples);
+    (trimmed, trimmed_secs)
+}
+
+/// Split WAV into 25-second segments using hound (no external tools required),
+/// transcribe each via Groq Whisper, and join results.
+/// Prevents Whisper from dropping speech at the end of long recordings.
+fn transcribe_groq_wav_in_chunks(
+    wav_path: &std::path::Path,
+    api_key: &str,
+    language: Option<&str>,
+    vad_path: Option<&std::path::Path>,
+) -> Result<String> {
+    use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+    use std::io::Cursor;
+
+    let mut reader = WavReader::open(wav_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open WAV for chunking: {}", e))?;
+    let spec = reader.spec();
+
+    // Normalise to i16 samples regardless of source format
+    let raw_samples: Vec<i16> = match spec.sample_format {
+        SampleFormat::Int => reader
+            .samples::<i16>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?,
+        SampleFormat::Float => reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("WAV read error: {}", e))?
+            .into_iter()
+            .map(|s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .collect(),
+    };
+
+    // Trim trailing silence — eliminates Whisper hallucination triggers
+    let all_samples = if let Some(vp) = vad_path {
+        let (trimmed, cut_secs) = trim_trailing_silence_i16(raw_samples, spec.sample_rate, spec.channels, vp);
+        if cut_secs > 0.05 {
+            info!("VAD trimmed {:.2}s of trailing silence", cut_secs);
+        }
+        trimmed
+    } else {
+        raw_samples
+    };
+
+    if all_samples.is_empty() {
+        return Err(anyhow::anyhow!("No samples left after VAD trim"));
+    }
+
+    // Chunking strategy: 25s chunks, but never leave a tiny tail.
+    // A trailing chunk under 5s is fed only ~1-2 seconds of speech to Whisper,
+    // which causes it to fall back to memorised endings ("Продолжение следует…").
+    // To avoid this, we merge a short tail into the preceding chunk — the result
+    // (up to ~30s) still fits Whisper's internal window.
+    let chunk_samples = (25 * spec.sample_rate * spec.channels as u32) as usize;
+    let min_last_samples = (5 * spec.sample_rate * spec.channels as u32) as usize;
+
+    let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0;
+    while pos < all_samples.len() {
+        let end = (pos + chunk_samples).min(all_samples.len());
+        chunk_ranges.push((pos, end));
+        pos = end;
+    }
+    if chunk_ranges.len() >= 2 {
+        let (last_start, last_end) = *chunk_ranges.last().unwrap();
+        if last_end - last_start < min_last_samples {
+            chunk_ranges.pop();
+            chunk_ranges.last_mut().unwrap().1 = last_end;
+        }
+    }
+
+    let total_chunks = chunk_ranges.len();
+    info!("Splitting into {} chunks", total_chunks);
+
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    // Returns true when a chunk result looks like Whisper hallucination rather than real speech.
+    // Checks: known hallucination markers, "и так далее" as the ENTIRE result, too sparse.
+    let chunk_is_bad = |text: &str, chunk_len: usize| -> bool {
+        let lower = text.to_lowercase();
+        if lower.contains("субтитр") || lower.contains("dimatorzok") {
+            return true;
+        }
+        // "и так далее" as the whole chunk (not as a natural sentence ending) is a hallucination
+        let trimmed_lower = text.trim().to_lowercase();
+        let only_etc = trimmed_lower == "и так далее."
+            || trimmed_lower == "и так далее"
+            || trimmed_lower == "и т.д."
+            || trimmed_lower == "и т. д.";
+        if only_etc {
+            return true;
+        }
+        // Too sparse: real speech produces ~10+ chars/sec; < 4 chars/sec on a chunk > 5s = truncated
+        let chunk_secs = chunk_len as f64 / (spec.sample_rate as f64 * spec.channels as f64);
+        if chunk_secs > 5.0 && (text.chars().count() as f64 / chunk_secs) < 4.0 {
+            return true;
+        }
+        false
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for (i, &(start, end)) in chunk_ranges.iter().enumerate() {
+        let chunk = &all_samples[start..end];
+        // Write chunk to a temp WAV file
+        let chunk_path = std::env::temp_dir().join(format!("handy_chunk_{}_{}.wav", ts, i));
+        let chunk_spec = WavSpec {
+            channels: spec.channels,
+            sample_rate: spec.sample_rate,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        {
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut writer = WavWriter::new(&mut cursor, chunk_spec)
+                    .map_err(|e| anyhow::anyhow!("WavWriter error: {}", e))?;
+                for &s in chunk {
+                    writer.write_sample(s)
+                        .map_err(|e| anyhow::anyhow!("WAV write error: {}", e))?;
+                }
+                writer.finalize()
+                    .map_err(|e| anyhow::anyhow!("WAV finalize error: {}", e))?;
+            }
+            std::fs::write(&chunk_path, cursor.into_inner())
+                .map_err(|e| anyhow::anyhow!("Failed to write chunk: {}", e))?;
+        }
+
+        match transcribe_via_groq_file(&chunk_path, api_key, language) {
+            Ok(text1) => {
+                let trimmed1 = text1.trim().to_string();
+                let final_text = if chunk_is_bad(&trimmed1, chunk.len()) {
+                    warn!("Chunk {}/{} looks like hallucination ({}), retrying", i + 1, total_chunks, trimmed1.chars().count());
+                    match transcribe_via_groq_file(&chunk_path, api_key, language) {
+                        Ok(text2) => {
+                            let trimmed2 = text2.trim().to_string();
+                            if chunk_is_bad(&trimmed2, chunk.len()) {
+                                // Both bad — take the longer one
+                                if trimmed2.chars().count() > trimmed1.chars().count() { trimmed2 } else { trimmed1 }
+                            } else {
+                                trimmed2
+                            }
+                        }
+                        Err(e) => { warn!("Chunk {}/{} retry failed: {}", i + 1, total_chunks, e); trimmed1 }
+                    }
+                } else {
+                    trimmed1
+                };
+                if !final_text.is_empty() {
+                    info!("Chunk {}/{}: {} chars", i + 1, total_chunks, final_text.chars().count());
+                    parts.push(final_text);
+                }
+            }
+            Err(e) => warn!("Chunk {}/{} transcription failed: {}", i + 1, total_chunks, e),
+        }
+        let _ = std::fs::remove_file(&chunk_path);
+    }
+
+    if parts.is_empty() {
+        return Err(anyhow::anyhow!("All chunks failed to transcribe"));
+    }
+
+    Ok(parts.join(" "))
+}
+
 /// Call Groq Whisper API and return transcribed text.
 /// Uses curl with --noproxy to bypass system proxy settings.
 fn transcribe_via_groq(
@@ -1028,7 +1265,6 @@ fn transcribe_via_groq(
         "-H".into(), format!("Authorization: Bearer {}", api_key),
         "-F".into(), "model=whisper-large-v3".into(),
         "-F".into(), "response_format=text".into(),
-        "-F".into(), "prompt=Геткурс, Getcourse, Claude, VPN, VS Code, GPT, Вагэ".into(),
         "-F".into(), format!(
             "file=@{};filename=audio.wav;type=audio/wav",
             temp_path.to_str().unwrap_or("/tmp/handy_groq_audio.wav")
@@ -1202,12 +1438,16 @@ fn add_paragraphs(text: &str, _api_key: &str) -> String {
         return text.to_string();
     }
 
-    // Split into sentences on . ! ? keeping the delimiter
+    // Split into sentences on . ! ? — but only flush at the LAST terminator in a run
+    // (so "?!" or "..." counts as ONE end-of-sentence, not 2-3).
+    let chars: Vec<char> = text.chars().collect();
+    let is_term = |c: char| matches!(c, '.' | '!' | '?');
     let mut sentences: Vec<String> = Vec::new();
     let mut current = String::new();
-    for ch in text.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
         current.push(ch);
-        if matches!(ch, '.' | '!' | '?') {
+        // Flush only if this is a terminator AND the next char isn't also a terminator.
+        if is_term(ch) && chars.get(i + 1).map_or(true, |&nc| !is_term(nc)) {
             let trimmed = current.trim().to_string();
             if !trimmed.is_empty() {
                 sentences.push(trimmed);

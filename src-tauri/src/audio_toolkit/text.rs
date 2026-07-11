@@ -231,9 +231,17 @@ fn get_filler_words_for_language(lang: &str) -> &'static [&'static str] {
 
 static MULTI_SPACE_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s{2,}").unwrap());
 
-// Whisper hallucination patterns that appear at the end of transcriptions
+// Whisper hallucination patterns that appear at the end of transcriptions.
 static WHISPER_HALLUCINATION_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\s*[Сс]убтитр[ыа](\s+(создавал[аи]?|перевод[ил]*|by|сделал[аи]?))?[\s\S]*$").unwrap()
+    Regex::new(
+        r"(?i)\s*(?:[Сс]убтитр[ыа]\s+(создавал[аи]?|перевод[ил]*|by|сделал[аи]?)[^\n]*|[Рр]едактор\s+субтитр[ов]*[^\n]*)$"
+    ).unwrap()
+});
+
+// Whisper sometimes appends a single-word "answer" after a question it transcribed.
+// "Или нет? Да." → strip the trailing "Да."
+static TRAILING_ANSWER_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)\?\s*(?:Да|Нет|Ладно|Конечно|Точно|Ага|Окей|Ok|Ок)\.?\s*$").unwrap()
 });
 
 /// Collapses repeated 1-2 letter words (3+ repetitions) to a single instance.
@@ -315,8 +323,11 @@ pub fn filter_transcription_output(
         filtered = pattern.replace_all(&filtered, "").to_string();
     }
 
-    // Strip Whisper subtitle hallucinations ("Субтитры создавал DimaTorzok" etc.)
+    // Strip Whisper subtitle hallucinations ("Субтитры создавал DimaTorzok", "Редактор субтитров А.Семкин" etc.)
     filtered = WHISPER_HALLUCINATION_PATTERN.replace(&filtered, "").to_string();
+
+    // Strip single-word "answer" Whisper appends after a transcribed question ("Или нет? Да.")
+    filtered = TRAILING_ANSWER_PATTERN.replace(&filtered, "?").to_string();
 
     // Collapse repeated 1-2 letter words (stutter artifacts like "wh wh wh wh")
     filtered = collapse_stutters(&filtered);
